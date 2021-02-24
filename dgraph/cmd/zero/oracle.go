@@ -43,11 +43,10 @@ type syncMark struct {
 // Oracle stores and manages the transaction state and conflict detection.
 type Oracle struct {
 	x.SafeMutex
-	commits map[uint64]uint64 // startTs -> commitTs
+	commits *sync.Map // startTs -> commitTs
 	// TODO: Check if we need LRU.
-	keyCommitLock sync.RWMutex // lock for key commit map. Maybe create a new structure for locked tree.
-	keyCommit     *z.Tree      // fp(key) -> commitTs. Used to detect conflict.
-	maxAssigned   uint64       // max transaction assigned by us.
+	keyCommit   *z.Tree // fp(key) -> commitTs. Used to detect conflict.
+	maxAssigned uint64  // max transaction assigned by us.
 
 	// All transactions with startTs < startTxnTs return true for hasConflict.
 	startTxnTs  uint64
@@ -58,7 +57,7 @@ type Oracle struct {
 
 // Init initializes the oracle.
 func (o *Oracle) Init() {
-	o.commits = make(map[uint64]uint64)
+	o.commits = &sync.Map{}
 	// Remove the older btree file, before creating NewTree, as it may contain stale data leading
 	// to wrong results.
 	o.keyCommit = z.NewTree()
@@ -74,23 +73,15 @@ func (o *Oracle) close() {
 
 func (o *Oracle) updateStartTxnTs(ts uint64) {
 	o.Lock()
+	defer o.Unlock()
 	o.startTxnTs = ts
-	o.Unlock()
-	o.keyCommitLock.Lock()
-	defer o.keyCommitLock.Unlock()
 	o.keyCommit.Reset()
 }
 
 // TODO: This should be done during proposal application for Txn status.
 func (o *Oracle) hasConflict(src *api.TxnContext) bool {
 	// This transaction was started before I became leader.
-
-	// Do this locking outside this function to prevent programming bug causing deadlock.
-	o.RLock()
-	startTs := o.startTxnTs
-	o.RUnlock()
-
-	if src.StartTs < startTs {
+	if src.StartTs < o.startTxnTs {
 		return true
 	}
 	for _, k := range src.Keys {
@@ -111,22 +102,23 @@ func (o *Oracle) purgeBelow(minTs uint64) {
 	timer.Start()
 
 	o.Lock()
+	defer o.Unlock()
 
 	// Set startTxnTs so that every txn with start ts less than this, would be aborted.
 	o.startTxnTs = minTs
-
+	var length uint64
 	// Dropping would be cheaper if abort/commits map is sharded
-	for ts := range o.commits {
+	o.commits.Range(func(key, value interface{}) bool {
+		ts := key.(uint64)
 		if ts < minTs {
-			delete(o.commits, ts)
+			o.commits.Delete(ts)
+		} else {
+			length++
 		}
-	}
-	o.Unlock()
-
+		return true
+	})
 	timer.Record("commits")
 
-	o.keyCommitLock.Lock()
-	defer o.keyCommitLock.Unlock()
 	// There is no transaction running with startTs less than minTs
 	// So we can delete everything from rowCommit whose commitTs < minTs
 	stats := o.keyCommit.Stats()
@@ -136,15 +128,15 @@ func (o *Oracle) purgeBelow(minTs uint64) {
 	o.keyCommit.DeleteBelow(minTs)
 	timer.Record("deleteBelow")
 	glog.V(2).Infof("Purged below ts:%d, len(o.commits):%d, keyCommit: [before: %+v, after: %+v].\n",
-		minTs, len(o.commits), stats, o.keyCommit.Stats())
+		minTs, length, stats, o.keyCommit.Stats())
 	if timer.Total() > time.Second {
 		glog.V(2).Infof("Purge %s\n", timer.String())
 	}
 }
 
 func (o *Oracle) commit(src *api.TxnContext) error {
-	o.keyCommitLock.Lock()
-	defer o.keyCommitLock.Unlock()
+	o.Lock()
+	defer o.Unlock()
 
 	if o.hasConflict(src) {
 		return x.ErrConflict
@@ -166,10 +158,11 @@ func (o *Oracle) commit(src *api.TxnContext) error {
 func (o *Oracle) currentState() *pb.OracleDelta {
 	o.AssertRLock()
 	resp := &pb.OracleDelta{}
-	for start, commit := range o.commits {
+	o.commits.Range(func(key, value interface{}) bool {
 		resp.Txns = append(resp.Txns,
-			&pb.TxnStatus{StartTs: start, CommitTs: commit})
-	}
+			&pb.TxnStatus{StartTs: key.(uint64), CommitTs: value.(uint64)})
+		return true
+	})
 	resp.MaxAssigned = o.maxAssigned
 	return resp
 }
@@ -270,15 +263,13 @@ func (o *Oracle) sendDeltasToSubscribers() {
 }
 
 func (o *Oracle) updateCommitStatusHelper(index uint64, src *api.TxnContext) bool {
-	o.Lock()
-	defer o.Unlock()
-	if _, ok := o.commits[src.StartTs]; ok {
-		return false
+	if _, ok := o.commits.Load(src.StartTs); ok {
+		return true
 	}
 	if src.Aborted {
-		o.commits[src.StartTs] = 0
+		o.commits.Store(src.StartTs, 0)
 	} else {
-		o.commits[src.StartTs] = src.CommitTs
+		o.commits.Store(src.StartTs, src.CommitTs)
 	}
 	return true
 }
@@ -296,9 +287,8 @@ func (o *Oracle) updateCommitStatus(index uint64, src *api.TxnContext) {
 }
 
 func (o *Oracle) commitTs(startTs uint64) uint64 {
-	o.RLock()
-	defer o.RUnlock()
-	return o.commits[startTs]
+	ts, _ := o.commits.Load(startTs)
+	return ts.(uint64)
 }
 
 func (o *Oracle) storePending(ids *pb.AssignedIds) {
@@ -368,9 +358,9 @@ func (s *Server) commit(ctx context.Context, src *api.TxnContext) error {
 	}
 
 	// Use the start timestamp to check if we have a conflict, before we need to assign a commit ts.
-	s.orc.keyCommitLock.RLock()
+	s.orc.RLock()
 	conflict := s.orc.hasConflict(src)
-	s.orc.keyCommitLock.RUnlock()
+	s.orc.RUnlock()
 	if conflict {
 		span.Annotate([]otrace.Attribute{otrace.BoolAttribute("abort", true)},
 			"Oracle found conflict")
