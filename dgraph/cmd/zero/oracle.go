@@ -108,13 +108,13 @@ func (o *Oracle) purgeBelow(minTs uint64) {
 	o.startTxnTs = minTs
 	var length uint64
 	// Dropping would be cheaper if abort/commits map is sharded
-	o.commits.Range(func(key, value interface{}) bool {
-		ts := key.(uint64)
+	o.commits.Range(func(startTs, _ interface{}) bool {
+		ts := startTs.(uint64)
 		if ts < minTs {
 			o.commits.Delete(ts)
-		} else {
-			length++
+			return true
 		}
+		length++
 		return true
 	})
 	timer.Record("commits")
@@ -158,9 +158,9 @@ func (o *Oracle) commit(src *api.TxnContext) error {
 func (o *Oracle) currentState() *pb.OracleDelta {
 	o.AssertRLock()
 	resp := &pb.OracleDelta{}
-	o.commits.Range(func(key, value interface{}) bool {
+	o.commits.Range(func(start, commit interface{}) bool {
 		resp.Txns = append(resp.Txns,
-			&pb.TxnStatus{StartTs: key.(uint64), CommitTs: value.(uint64)})
+			&pb.TxnStatus{StartTs: start.(uint64), CommitTs: commit.(uint64)})
 		return true
 	})
 	resp.MaxAssigned = o.maxAssigned
