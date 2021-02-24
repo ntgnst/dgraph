@@ -263,15 +263,12 @@ func (o *Oracle) sendDeltasToSubscribers() {
 }
 
 func (o *Oracle) updateCommitStatusHelper(index uint64, src *api.TxnContext) bool {
-	if _, ok := o.commits.Load(src.StartTs); ok {
-		return true
-	}
+	ts := src.CommitTs
 	if src.Aborted {
-		o.commits.Store(src.StartTs, 0)
-	} else {
-		o.commits.Store(src.StartTs, src.CommitTs)
+		ts = 0
 	}
-	return true
+	_, exist := o.commits.LoadOrStore(src.StartTs, ts)
+	return !exist
 }
 
 func (o *Oracle) updateCommitStatus(index uint64, src *api.TxnContext) {
